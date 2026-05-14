@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/seesaw/common/seesaw"
 	pb "github.com/google/seesaw/pb/config"
+	spb "github.com/google/seesaw/pb/seesaw"
 
 	"github.com/golang/protobuf/proto"
 )
@@ -105,7 +106,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        255,
-				State:           seesaw.HAUnknown,
+				State:           spb.HaState_UNKNOWN,
 				AnycastEnabled:  true,
 				BGPEnabled:      true,
 				VserversEnabled: true,
@@ -117,7 +118,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        1,
-				State:           seesaw.HAUnknown,
+				State:           spb.HaState_UNKNOWN,
 				AnycastEnabled:  true,
 				BGPEnabled:      true,
 				VserversEnabled: true,
@@ -135,7 +136,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        255,
-				State:           seesaw.HADisabled,
+				State:           spb.HaState_DISABLED,
 				AnycastEnabled:  true,
 				BGPEnabled:      true,
 				VserversEnabled: true,
@@ -153,7 +154,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        255,
-				State:           seesaw.HADisabled,
+				State:           spb.HaState_DISABLED,
 				AnycastEnabled:  false,
 				BGPEnabled:      false,
 				VserversEnabled: false,
@@ -171,7 +172,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        255,
-				State:           seesaw.HADisabled,
+				State:           spb.HaState_DISABLED,
 				AnycastEnabled:  false,
 				BGPEnabled:      false,
 				VserversEnabled: false,
@@ -183,7 +184,7 @@ var nodeTests = []struct {
 					IPv4Mask: net.CIDRMask(26, 32),
 				},
 				Priority:        1,
-				State:           seesaw.HAUnknown,
+				State:           spb.HaState_UNKNOWN,
 				AnycastEnabled:  true,
 				BGPEnabled:      true,
 				VserversEnabled: true,
@@ -209,12 +210,22 @@ var vipSubnetTests = []struct {
 		make(map[string]*net.IPNet),
 	},
 	{
-		"3 Dedicated VIP Subnets, with duplicates",
+		"2 Dedicated VIP Subnets",
 		"vipsubnets1.pb",
 		map[string]*net.IPNet{
 			"192.168.9.0/24":   cidrToNet("192.168.9.0/24"),
 			"2015:cafe:9::/64": cidrToNet("2015:cafe:9::/64"),
 		},
+	},
+}
+
+var vipSubnetFailureTests = []struct {
+	desc string
+	in   string
+}{
+	{
+		"Duplicate Dedicated VIP Subnets",
+		"vipsubnets2.pb",
 	},
 }
 
@@ -311,13 +322,13 @@ var vserverTests = []struct {
 		"vservers1.pb",
 		map[string]*Vserver{
 			"dns.resolver.anycast@au-syd": {
-				"dns.resolver.anycast@au-syd",
-				seesaw.Host{
+				Name: "dns.resolver.anycast@au-syd",
+				Host: seesaw.Host{
 					Hostname: "dns-anycast.example.com.",
 					IPv4Addr: net.ParseIP("192.168.255.1").To4(),
 					IPv4Mask: net.CIDRMask(24, 32),
 				},
-				map[string]*VserverEntry{
+				Entries: map[string]*VserverEntry{
 					"53/UDP": {
 						Port:          53,
 						Proto:         seesaw.IPProtoUDP,
@@ -351,7 +362,7 @@ var vserverTests = []struct {
 						Healthchecks: make(map[string]*Healthcheck),
 					},
 				},
-				map[string]*seesaw.Backend{
+				Backends: map[string]*seesaw.Backend{
 					"dns1-1.example.com.": {
 						Host: seesaw.Host{
 							Hostname: "dns1-1.example.com.",
@@ -373,7 +384,7 @@ var vserverTests = []struct {
 						InService: true,
 					},
 				},
-				map[string]*Healthcheck{
+				Healthchecks: map[string]*Healthcheck{
 					"HTTP/16767_0": {
 						Name:      "HTTP/16767_0",
 						Mode:      seesaw.HCModeDSR,
@@ -387,26 +398,27 @@ var vserverTests = []struct {
 						Code:      200,
 					},
 				},
-				map[string]*seesaw.VIP{
+				VIPs: map[string]*seesaw.VIP{
 					"192.168.255.1 (Anycast)": {
-						seesaw.NewIP(net.ParseIP("192.168.255.1")),
-						seesaw.AnycastVIP,
+						IP:   seesaw.NewIP(net.ParseIP("192.168.255.1")),
+						Type: seesaw.AnycastVIP,
 					},
 				},
-				true,
-				false,
-				nil,
+				AccessGrants: map[string]*AccessGrant{},
+				Enabled:      true,
+				UseFWM:       false,
+				Warnings:     nil,
 			},
 			"dns.resolver@au-syd": {
-				"dns.resolver@au-syd",
-				seesaw.Host{
+				Name: "dns.resolver@au-syd",
+				Host: seesaw.Host{
 					Hostname: "dns-vip1.example.com.",
 					IPv4Addr: net.ParseIP("192.168.36.1").To4(),
 					IPv4Mask: net.CIDRMask(26, 32),
 					IPv6Addr: net.ParseIP("2015:cafe:36::a800:1ff:ffee:dd01"),
 					IPv6Mask: net.CIDRMask(64, 128),
 				},
-				map[string]*VserverEntry{
+				Entries: map[string]*VserverEntry{
 					"53/UDP": {
 						Port:         53,
 						Proto:        seesaw.IPProtoUDP,
@@ -422,30 +434,31 @@ var vserverTests = []struct {
 						Healthchecks: make(map[string]*Healthcheck),
 					},
 				},
-				make(map[string]*seesaw.Backend),
-				make(map[string]*Healthcheck),
-				map[string]*seesaw.VIP{
+				Backends:     make(map[string]*seesaw.Backend),
+				Healthchecks: make(map[string]*Healthcheck),
+				VIPs: map[string]*seesaw.VIP{
 					"192.168.36.1 (Dedicated)": {
-						seesaw.NewIP(net.ParseIP("192.168.36.1")),
-						seesaw.DedicatedVIP,
+						IP:   seesaw.NewIP(net.ParseIP("192.168.36.1")),
+						Type: seesaw.DedicatedVIP,
 					},
 					"2015:cafe:36:0:a800:1ff:ffee:dd01 (Dedicated)": {
-						seesaw.NewIP(net.ParseIP("2015:cafe:36::a800:1ff:ffee:dd01")),
-						seesaw.DedicatedVIP,
+						IP:   seesaw.NewIP(net.ParseIP("2015:cafe:36::a800:1ff:ffee:dd01")),
+						Type: seesaw.DedicatedVIP,
 					},
 				},
-				true,
-				false,
-				nil,
+				AccessGrants: map[string]*AccessGrant{},
+				Enabled:      true,
+				UseFWM:       false,
+				Warnings:     nil,
 			},
 			"irc.server@au-syd": {
-				"irc.server@au-syd",
-				seesaw.Host{
+				Name: "irc.server@au-syd",
+				Host: seesaw.Host{
 					Hostname: "irc-anycast.example.com.",
 					IPv4Addr: net.ParseIP("192.168.255.2").To4(),
 					IPv4Mask: net.CIDRMask(24, 32),
 				},
-				map[string]*VserverEntry{
+				Entries: map[string]*VserverEntry{
 					"80/TCP": {
 						Port:         80,
 						Proto:        seesaw.IPProtoTCP,
@@ -481,7 +494,7 @@ var vserverTests = []struct {
 						},
 					},
 				},
-				map[string]*seesaw.Backend{
+				Backends: map[string]*seesaw.Backend{
 					"irc1-1.example.com.": {
 						Host: seesaw.Host{
 							Hostname: "irc1-1.example.com.",
@@ -495,7 +508,7 @@ var vserverTests = []struct {
 						InService: true,
 					},
 				},
-				map[string]*Healthcheck{
+				Healthchecks: map[string]*Healthcheck{
 					"TCP/6667_0": {
 						Name:      "TCP/6667_0",
 						Mode:      seesaw.HCModePlain,
@@ -509,15 +522,90 @@ var vserverTests = []struct {
 						Retries:   2,
 					},
 				},
-				map[string]*seesaw.VIP{
+				VIPs: map[string]*seesaw.VIP{
 					"192.168.255.2 (Anycast)": {
-						seesaw.NewIP(net.ParseIP("192.168.255.2")),
-						seesaw.AnycastVIP,
+						IP:   seesaw.NewIP(net.ParseIP("192.168.255.2")),
+						Type: seesaw.AnycastVIP,
 					},
 				},
-				true,
-				false,
-				nil,
+				AccessGrants: map[string]*AccessGrant{
+					"group:irc-admin": {
+						Grantee: "irc-admin",
+						IsGroup: true,
+					},
+					"group:irc-oncall": {
+						Grantee: "irc-oncall",
+						IsGroup: true,
+					},
+				},
+				Enabled:  true,
+				UseFWM:   false,
+				Warnings: nil,
+			},
+		},
+	},
+	{
+		"1 Vserver with Unicast address and Maglev scheduler",
+		"vservers2.pb",
+		map[string]*Vserver{
+			"api.gateway1@as-hkg": {
+				Name: "api.gateway1@as-hkg",
+				Host: seesaw.Host{
+					Hostname: "gateway1-vip1.example.com.",
+					IPv4Addr: net.ParseIP("192.168.36.1").To4(),
+					IPv4Mask: net.CIDRMask(26, 32),
+					IPv6Addr: net.ParseIP("2015:cafe:36::a800:1ff:ffee:dd01"),
+					IPv6Mask: net.CIDRMask(64, 128),
+				},
+				Entries: map[string]*VserverEntry{
+					"443/TCP": {
+						Port:         443,
+						Proto:        seesaw.IPProtoTCP,
+						Scheduler:    seesaw.LBSchedulerMH,
+						Mode:         seesaw.LBModeTUN,
+						Healthchecks: make(map[string]*Healthcheck),
+					},
+				},
+				Backends: map[string]*seesaw.Backend{
+					"gateway1-1.example.com.": {
+						Host: seesaw.Host{
+							Hostname: "gateway1-1.example.com.",
+							IPv4Addr: net.ParseIP("192.168.36.2").To4(),
+							IPv4Mask: net.CIDRMask(26, 32),
+						},
+						Weight:    5,
+						Enabled:   true,
+						InService: true,
+					},
+				},
+				Healthchecks: map[string]*Healthcheck{
+					"HTTP/8001_0": {
+						Name:      "HTTP/8001_0",
+						Mode:      seesaw.HCModeTUN,
+						Type:      seesaw.HCTypeHTTP,
+						Port:      8001,
+						Interval:  time.Duration(10 * time.Second), // protobuf default
+						Timeout:   time.Duration(5 * time.Second),  // protobuf default
+						TLSVerify: false,
+						Send:      "/healthz",
+						Receive:   "Ok",
+						Code:      200,
+					},
+				},
+				VIPs: map[string]*seesaw.VIP{
+					"192.168.36.1 (Unicast)": {
+						IP:   seesaw.NewIP(net.ParseIP("192.168.36.1")),
+						Type: seesaw.UnicastVIP,
+					},
+					"2015:cafe:36:0:a800:1ff:ffee:dd01 (Unicast)": {
+						IP:   seesaw.NewIP(net.ParseIP("2015:cafe:36::a800:1ff:ffee:dd01")),
+						Type: seesaw.UnicastVIP,
+					},
+				},
+				AccessGrants: map[string]*AccessGrant{},
+				Enabled:      true,
+				UseFWM:       false,
+				Warnings:     nil,
 			},
 		},
 	},
@@ -594,6 +682,15 @@ func TestVIPSubnets(t *testing.T) {
 			if !reflect.DeepEqual(*vipSubnet, *got[i]) {
 				t.Errorf("Test %q want %#v, got %#v", test.desc, *vipSubnet, *got[i])
 			}
+		}
+	}
+}
+
+func TestVIPSubnetFailures(t *testing.T) {
+	for _, test := range vipSubnetFailureTests {
+		filename := filepath.Join(testDataDir, test.in)
+		if _, err := ReadConfig(filename, ""); err == nil {
+			t.Errorf("ReadConfig successfully loaded protobuf file %s for %q, should have failed", test.in, test.desc)
 		}
 	}
 }

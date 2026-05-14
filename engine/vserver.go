@@ -22,6 +22,7 @@ package engine
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -61,7 +62,7 @@ type vserver struct {
 func newVserver(e *Engine) *vserver {
 	return &vserver{
 		engine: e,
-		ncc:    ncclient.NewNCC(e.config.NCCSocket),
+		ncc:    e.ncc,
 
 		fwm:        make(map[seesaw.AF]uint32),
 		active:     make(map[seesaw.IP]bool),
@@ -70,8 +71,8 @@ func newVserver(e *Engine) *vserver {
 
 		overrideChan: make(chan seesaw.Override, 5),
 
-		notify:  make(chan *checkNotification, 20),
-		update:  make(chan *config.Vserver, 1),
+		notify:  make(chan *checkNotification, 1000),
+		update:  make(chan *config.Vserver, 20),
 		quit:    make(chan bool, 1),
 		stopped: make(chan bool, 1),
 	}
@@ -107,31 +108,39 @@ type service struct {
 }
 
 // ipvsService returns an IPVS Service for the given service.
-func (svc *service) ipvsService() *ipvs.Service {
+func (s *service) ipvsService() *ipvs.Service {
 	var flags ipvs.ServiceFlags
-	if svc.ventry.Persistence > 0 {
+	if s.ventry.Persistence > 0 {
 		flags |= ipvs.SFPersistent
 	}
-	if svc.ventry.OnePacket {
+	if s.ventry.OnePacket {
 		flags |= ipvs.SFOnePacket
+	}
+	// Enables fallback and port for hashing schedulers.
+	// Maps to ipvs sh-fallback, sh-port, mh-fallback and mh-port.
+	switch s.ventry.Scheduler {
+	case seesaw.LBSchedulerSH:
+		flags |= ipvs.SFSchedSHFallback | ipvs.SFSchedSHPort
+	case seesaw.LBSchedulerMH:
+		flags |= ipvs.SFSchedMHFallback | ipvs.SFSchedMHPort
 	}
 	var ip net.IP
 	switch {
-	case svc.fwm > 0 && svc.af == seesaw.IPv4:
+	case s.fwm > 0 && s.af == seesaw.IPv4:
 		ip = net.IPv4zero
-	case svc.fwm > 0 && svc.af == seesaw.IPv6:
+	case s.fwm > 0 && s.af == seesaw.IPv6:
 		ip = net.IPv6zero
 	default:
-		ip = svc.ip.IP()
+		ip = s.ip.IP()
 	}
 	return &ipvs.Service{
 		Address:      ip,
-		Protocol:     ipvs.IPProto(svc.proto),
-		Port:         svc.port,
-		Scheduler:    svc.ventry.Scheduler.String(),
-		FirewallMark: svc.fwm,
+		Protocol:     ipvs.IPProto(s.proto),
+		Port:         s.port,
+		Scheduler:    s.ventry.Scheduler.String(),
+		FirewallMark: s.fwm,
 		Flags:        flags,
-		Timeout:      uint32(svc.ventry.Persistence),
+		Timeout:      uint32(s.ventry.Persistence),
 	}
 }
 
@@ -178,23 +187,25 @@ type destination struct {
 }
 
 // ipvsDestination returns an IPVS Destination for the given destination.
-func (dst *destination) ipvsDestination() *ipvs.Destination {
+func (d *destination) ipvsDestination() *ipvs.Destination {
 	var flags ipvs.DestinationFlags
-	switch dst.service.ventry.Mode {
+	switch d.service.ventry.Mode {
 	case seesaw.LBModeNone:
-		log.Warningf("%v: Unspecified LB mode", dst)
+		log.Warningf("%v: Unspecified LB mode", d)
 	case seesaw.LBModeDSR:
 		flags |= ipvs.DFForwardRoute
 	case seesaw.LBModeNAT:
 		flags |= ipvs.DFForwardMasq
+	case seesaw.LBModeTUN:
+		flags |= ipvs.DFForwardTunnel
 	}
 	return &ipvs.Destination{
-		Address:        dst.ip.IP(),
-		Port:           dst.service.port,
-		Weight:         dst.weight,
+		Address:        d.ip.IP(),
+		Port:           d.service.port,
+		Weight:         d.weight,
 		Flags:          flags,
-		LowerThreshold: uint32(dst.service.ventry.LThreshold),
-		UpperThreshold: uint32(dst.service.ventry.UThreshold),
+		LowerThreshold: uint32(d.service.ventry.LThreshold),
+		UpperThreshold: uint32(d.service.ventry.UThreshold),
 	}
 }
 
@@ -495,18 +506,11 @@ func (v *vserver) run() {
 
 		case <-statsTicker.C:
 			v.updateStats()
-		}
-
-		// Something changed - export a new vserver snapshot.
-		// The goroutine that drains v.engine.vserverChan also does a blocking write
-		// to each vserver's vserver.notify channel, which is drained by each
-		// vserver's goroutine (i.e., this one). So we need a timeout to avoid a
-		// deadlock.
-		timeout := time.After(1 * time.Second)
-		select {
-		case v.engine.vserverChan <- v.snapshot():
-		case <-timeout:
-			log.Warningf("%v: failed to send snapshot", v)
+			select {
+			case v.engine.vserverChan <- v.snapshot():
+			default:
+				log.Warningf("%v: failed to send snapshot", v)
+			}
 		}
 	}
 }
@@ -522,6 +526,9 @@ func (v *vserver) stop() {
 // updateConfig queues a vserver configuration update for processing. This
 // will block if a configuration update is already pending.
 func (v *vserver) updateConfig(config *config.Vserver) {
+	if reflect.DeepEqual(config, v.config) {
+		return
+	}
 	// TODO(jsing): Consider the implications of potentially blocking here.
 	v.update <- config
 }
@@ -529,7 +536,11 @@ func (v *vserver) updateConfig(config *config.Vserver) {
 // queueCheckNotification queues a checkNotification for processing.
 func (v *vserver) queueCheckNotification(n *checkNotification) {
 	// TODO(jsing): Consider the implications of potentially blocking here.
-	v.notify <- n
+	select {
+	case v.notify <- n:
+	default:
+		log.Warningf("Check notification skipped because the queue is full: %s.", v.String())
+	}
 }
 
 // queueOverride queues an Override for processing.
@@ -856,10 +867,6 @@ func (d *destination) up() {
 	log.Infof("%v: %v backend %v up", d.service.vserver, d.service, d)
 
 	ncc := d.service.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", d.service.vserver, err)
-	}
-	defer ncc.Close()
 	if err := ncc.IPVSAddDestination(d.service.ipvsSvc, d.ipvsDst); err != nil {
 		log.Fatalf("%v: failed to add destination %v: %v", d.service.vserver, d, err)
 	}
@@ -871,10 +878,6 @@ func (d *destination) down() {
 	log.Infof("%v: %v backend %v down", d.service.vserver, d.service, d)
 
 	ncc := d.service.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", d.service.vserver, err)
-	}
-	defer ncc.Close()
 	if err := ncc.IPVSDeleteDestination(d.service.ipvsSvc, d.ipvsDst); err != nil {
 		log.Fatalf("%v: failed to delete destination %v: %v", d.service.vserver, d, err)
 	}
@@ -912,10 +915,6 @@ func (d *destination) update(dest *destination) {
 
 	log.Infof("%v: %v updating IPVS destination %v", d.service.vserver, d.service, d)
 	ncc := d.service.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", d.service.vserver, err)
-	}
-	defer ncc.Close()
 
 	if err := ncc.IPVSUpdateDestination(d.service.ipvsSvc, d.ipvsDst); err != nil {
 		log.Fatalf("%v: failed to update destination %v: %v", d.service.vserver, d, err)
@@ -1030,10 +1029,6 @@ func (s *service) up() {
 	log.Infof("%v: %v service up", s.vserver, s)
 
 	ncc := s.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", s.vserver, err)
-	}
-	defer ncc.Close()
 
 	log.Infof("%v: adding IPVS service %v", s.vserver, s.ipvsSvc)
 	if err := ncc.IPVSAddService(s.ipvsSvc); err != nil {
@@ -1052,10 +1047,6 @@ func (s *service) down() {
 	log.Infof("%v: %v service down", s.vserver, s)
 
 	ncc := s.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", s.vserver, err)
-	}
-	defer ncc.Close()
 
 	// Remove IPVS destinations *before* the IPVS service is removed.
 	s.updateDests()
@@ -1086,10 +1077,6 @@ func (s *service) update(svc *service) {
 
 	log.Infof("%v: %v updating IPVS service", s.vserver, s)
 	ncc := s.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", s.vserver, err)
-	}
-	defer ncc.Close()
 
 	if err := ncc.IPVSUpdateService(s.ipvsSvc); err != nil {
 		log.Fatalf("%v: failed to update service %v: %v", s.vserver, s, err)
@@ -1104,10 +1091,6 @@ func (s *service) updateStats() {
 	log.V(1).Infof("%v: updating IPVS statistics for %v", s.vserver, s)
 
 	ncc := s.vserver.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", s.vserver, err)
-	}
-	defer ncc.Close()
 
 	ipvsSvc, err := ncc.IPVSGetService(s.ipvsSvc)
 	if err != nil {
@@ -1231,11 +1214,7 @@ func (v *vserver) updateServices(ip seesaw.IP) {
 // up brings up all healthy services for an IP address for a vserver, then
 // brings up the IP address.
 func (v *vserver) up(ip seesaw.IP) {
-	ncc := v.engine.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", v, err)
-	}
-	defer ncc.Close()
+	ncc := v.ncc
 
 	v.active[ip] = true
 	v.updateServices(ip)
@@ -1288,11 +1267,7 @@ func (v *vserver) downAll() {
 // down takes down an IP address for a vserver, then takes down all services
 // for that IP address.
 func (v *vserver) down(ip seesaw.IP) {
-	ncc := v.engine.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", v, err)
-	}
-	defer ncc.Close()
+	ncc := v.ncc
 
 	// If this is an anycast VIP, withdraw the BGP route.
 	nip := ip.IP()
@@ -1328,12 +1303,6 @@ func (v *vserver) updateStats() {
 
 // configureVIPs configures VIPs on the load balancing interface.
 func (v *vserver) configureVIPs() {
-	ncc := v.engine.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", v, err)
-	}
-	defer ncc.Close()
-
 	// TODO(ncope): Return to iterating over v.services once they contain seesaw.VIPs.
 	for _, vip := range v.config.VIPs {
 		if _, ok := v.vips[*vip]; ok {
@@ -1369,12 +1338,6 @@ func (v *vserver) unconfigureVIP(vip *seesaw.VIP) {
 		return
 	}
 	if configured {
-		ncc := v.engine.ncc
-		if err := ncc.Dial(); err != nil {
-			log.Fatalf("%v: failed to connect to NCC: %v", v, err)
-		}
-		defer ncc.Close()
-
 		if err := v.engine.lbInterface.DeleteVIP(vip); err != nil {
 			log.Fatalf("%v: failed to remove VIP %v: %v", v, vip, err)
 		}
@@ -1388,12 +1351,6 @@ func (v *vserver) unconfigureVIP(vip *seesaw.VIP) {
 
 // unconfigureVIPs removes unicast VIPs from the load balancing interface.
 func (v *vserver) unconfigureVIPs() {
-	ncc := v.engine.ncc
-	if err := ncc.Dial(); err != nil {
-		log.Fatalf("%v: failed to connect to NCC: %v", v, err)
-	}
-	defer ncc.Close()
-
 	// TODO(jsing): At a later date this will need to support VLAN
 	// interfaces and dedicated VIP subnets.
 	for vip := range v.vips {

@@ -47,9 +47,21 @@ var (
 		healthcheck.DefaultServerConfig().MaxFailures,
 		"The maximum number of consecutive notification failures")
 
+	notifyInterval = flag.Duration("notify_interval",
+		healthcheck.DefaultServerConfig().NotifyInterval,
+		"The time between notifications")
+
+	fetchInterval = flag.Duration("fetch_interval",
+		healthcheck.DefaultServerConfig().FetchInterval,
+		"The time between healthcheck config fetches from the Engine")
+
 	retryDelay = flag.Duration("retry_delay",
 		healthcheck.DefaultServerConfig().RetryDelay,
 		"The time between notification RPC retries")
+
+	dryRun = flag.Bool("dry_run",
+		healthcheck.DefaultServerConfig().DryRun,
+		"Skips actual check and always return healthy as result")
 )
 
 func main() {
@@ -57,11 +69,15 @@ func main() {
 
 	cfg := healthcheck.DefaultServerConfig()
 
+	cfg.BatchDelay = *batchDelay
 	cfg.BatchSize = *batchSize
 	cfg.ChannelSize = *channelSize
 	cfg.EngineSocket = *engineSocket
 	cfg.MaxFailures = *maxFailures
+	cfg.NotifyInterval = *notifyInterval
+	cfg.FetchInterval = *fetchInterval
 	cfg.RetryDelay = *retryDelay
+	cfg.DryRun = *dryRun
 
 	hc := healthcheck.NewServer(&cfg)
 	server.ShutdownHandler(hc)

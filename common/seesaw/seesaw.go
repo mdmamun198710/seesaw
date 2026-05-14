@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/google/seesaw/ipvs"
+	spb "github.com/google/seesaw/pb/seesaw"
 )
 
 const (
@@ -97,22 +98,10 @@ func (sc Component) String() string {
 	return "(unknown)"
 }
 
-// HAState indicates the High-Availability state of a Seesaw Node.
-type HAState int
-
-const (
-	HAUnknown HAState = iota
-	HABackup
-	HADisabled
-	HAError
-	HAMaster
-	HAShutdown
-)
-
 // HAStatus indicates the High-Availability status for a Seesaw Node.
 type HAStatus struct {
 	LastUpdate     time.Time
-	State          HAState
+	State          spb.HaState
 	Since          time.Time
 	Sent           uint64
 	Received       uint64
@@ -126,6 +115,7 @@ type HealthcheckMode int
 const (
 	HCModePlain HealthcheckMode = iota
 	HCModeDSR
+	HCModeTUN
 )
 
 // String returns the name for a given HealthcheckMode.
@@ -135,6 +125,8 @@ func (h HealthcheckMode) String() string {
 		return "PLAIN"
 	case HCModeDSR:
 		return "DSR"
+	case HCModeTUN:
+		return "TUN"
 	default:
 		return "(unknown)"
 	}
@@ -301,12 +293,14 @@ const (
 	LBModeNone LBMode = iota
 	LBModeDSR
 	LBModeNAT
+	LBModeTUN
 )
 
 var modeNames = map[LBMode]string{
 	LBModeNone: "None",
 	LBModeDSR:  "DSR",
 	LBModeNAT:  "NAT",
+	LBModeTUN:  "TUN",
 }
 
 // String returns the string representation of a LBMode.
@@ -327,6 +321,7 @@ const (
 	LBSchedulerLC
 	LBSchedulerWLC
 	LBSchedulerSH
+	LBSchedulerMH
 )
 
 var schedulerNames = map[LBScheduler]string{
@@ -336,6 +331,7 @@ var schedulerNames = map[LBScheduler]string{
 	LBSchedulerLC:   "lc",
 	LBSchedulerWLC:  "wlc",
 	LBSchedulerSH:   "sh",
+	LBSchedulerMH:   "mh",
 }
 
 // String returns the string representation of a LBScheduler.
@@ -403,7 +399,7 @@ type Host struct {
 type Node struct {
 	Host
 	Priority        uint8
-	State           HAState
+	State           spb.HaState
 	AnycastEnabled  bool
 	BGPEnabled      bool
 	VserversEnabled bool

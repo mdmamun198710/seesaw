@@ -35,6 +35,7 @@ import (
 	"github.com/google/seesaw/engine/config"
 	ncclient "github.com/google/seesaw/ncc/client"
 	ncctypes "github.com/google/seesaw/ncc/types"
+	spb "github.com/google/seesaw/pb/seesaw"
 
 	log "github.com/golang/glog"
 )
@@ -77,22 +78,29 @@ type Engine struct {
 
 	vservers map[string]*vserver
 
+	vserverAccess *vserverAccess
+
 	vserverSnapshots map[string]*seesaw.Vserver
 	vserverLock      sync.RWMutex
 	vserverChan      chan *seesaw.Vserver
+
+	startTime time.Time
+
+	arpMap  map[string][]net.IP // iface name -> IP list
+	arpLock sync.Mutex
 }
 
-// NewEngine returns an initialised Engine struct.
-func NewEngine(cfg *config.EngineConfig) *Engine {
+func newEngineWithNCC(cfg *config.EngineConfig, ncc ncclient.NCC) *Engine {
 	if cfg == nil {
 		defaultCfg := config.DefaultEngineConfig()
 		cfg = &defaultCfg
 	}
+
 	// TODO(jsing): Validate node, peer and cluster IP configuration.
 	engine := &Engine{
 		config:   cfg,
 		fwmAlloc: newMarkAllocator(fwmAllocBase, fwmAllocSize),
-		ncc:      ncclient.NewNCC(cfg.NCCSocket),
+		ncc:      ncc,
 
 		overrides:    make(map[string]seesaw.Override),
 		overrideChan: make(chan seesaw.Override),
@@ -105,6 +113,8 @@ func NewEngine(cfg *config.EngineConfig) *Engine {
 		shutdownIPC: make(chan bool),
 		shutdownRPC: make(chan bool),
 
+		vserverAccess: newVserverAccess(),
+
 		vserverSnapshots: make(map[string]*seesaw.Vserver),
 		vserverChan:      make(chan *seesaw.Vserver, 1000),
 	}
@@ -114,6 +124,15 @@ func NewEngine(cfg *config.EngineConfig) *Engine {
 	engine.syncClient = newSyncClient(engine)
 	engine.syncServer = newSyncServer(engine)
 	return engine
+}
+
+// NewEngine returns an initialised Engine struct.
+func NewEngine(cfg *config.EngineConfig) *Engine {
+	ncc, err := ncclient.NewNCC(cfg.NCCSocket)
+	if err != nil {
+		log.Fatalf("Failed to create ncc client: %v", err)
+	}
+	return newEngineWithNCC(cfg, ncc)
 }
 
 // Run starts the Engine.
@@ -161,13 +180,23 @@ func (e *Engine) queueOverride(o seesaw.Override) {
 }
 
 // setHAState tells the engine what its current HAState should be.
-func (e *Engine) setHAState(state seesaw.HAState) {
-	e.haManager.stateChan <- state
+func (e *Engine) setHAState(state spb.HaState) error {
+	select {
+	case e.haManager.stateChan <- state:
+	default:
+		return fmt.Errorf("state channel if full")
+	}
+	return nil
 }
 
 // setHAStatus tells the engine what the current HA status is.
-func (e *Engine) setHAStatus(status seesaw.HAStatus) {
-	e.haManager.statusChan <- status
+func (e *Engine) setHAStatus(status seesaw.HAStatus) error {
+	select {
+	case e.haManager.statusChan <- status:
+	default:
+		return fmt.Errorf("status channel if full")
+	}
+	return nil
 }
 
 // haConfig returns the HAConfig for an engine.
@@ -178,7 +207,7 @@ func (e *Engine) haConfig() (*seesaw.HAConfig, error) {
 	}
 	// TODO(jsing): This does not allow for IPv6-only operation.
 	return &seesaw.HAConfig{
-		Enabled:    n.State != seesaw.HADisabled,
+		Enabled:    n.State != spb.HaState_DISABLED,
 		LocalAddr:  e.config.Node.IPv4Addr,
 		RemoteAddr: e.config.VRRPDestIP,
 		Priority:   n.Priority,
@@ -246,11 +275,6 @@ func (e *Engine) syncRPC() {
 
 // initNetwork initialises the network configuration for load balancing.
 func (e *Engine) initNetwork() {
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	if e.config.AnycastEnabled {
 		if err := e.ncc.BGPWithdrawAll(); err != nil {
 			log.Fatalf("Failed to withdraw all BGP advertisements: %v", err)
@@ -267,6 +291,7 @@ func (e *Engine) initNetwork() {
 		Node:           e.config.Node,
 		RoutingTableID: e.config.RoutingTableID,
 		VRID:           e.config.VRID,
+		UseVMAC:        e.config.UseVMAC,
 	}
 	e.lbInterface = e.ncc.NewLBInterface(e.config.LBInterface, lbCfg)
 
@@ -281,11 +306,6 @@ func (e *Engine) initNetwork() {
 
 // initAnycast initialises the anycast configuration.
 func (e *Engine) initAnycast() {
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	vips := make([]*seesaw.VIP, 0)
 	if e.config.ClusterVIP.IPv4Addr != nil {
 		for _, ip := range e.config.ServiceAnycastIPv4 {
@@ -316,23 +336,21 @@ func (e *Engine) gratuitousARP() {
 	for {
 		select {
 		case <-arpTicker.C:
-			if e.haManager.state() != seesaw.HAMaster {
+			if e.haManager.state() != spb.HaState_LEADER {
 				if announced {
-					log.Infof("Stopping gratuitous ARPs for %s", e.config.ClusterVIP.IPv4Addr)
+					log.Info("Stopping gratuitous ARPs")
 					announced = false
 				}
 				continue
 			}
 			if !announced {
-				log.Infof("Starting gratuitous ARPs for %s via %s every %s",
-					e.config.ClusterVIP.IPv4Addr, e.config.LBInterface, e.config.GratuitousARPInterval)
+				log.Infof("Starting gratuitous ARPs every %s", e.config.GratuitousARPInterval)
 				announced = true
 			}
-			if err := e.ncc.Dial(); err != nil {
-				log.Fatalf("Failed to connect to NCC: %v", err)
-			}
-			defer e.ncc.Close()
-			if err := e.ncc.ARPSendGratuitous(e.config.LBInterface, e.config.ClusterVIP.IPv4Addr); err != nil {
+			e.arpLock.Lock()
+			arpMap := e.arpMap
+			e.arpLock.Unlock()
+			if err := e.ncc.ARPSendGratuitous(arpMap); err != nil {
 				log.Fatalf("Failed to send gratuitous ARP: %v", err)
 			}
 
@@ -347,15 +365,42 @@ func (e *Engine) gratuitousARP() {
 // seesaw engine.
 func (e *Engine) manager() {
 	for {
+		// process ha state updates first before processing others
 		select {
+		case state := <-e.haManager.stateChan:
+			log.Infof("Received HA state notification %v", state)
+			e.haManager.setState(state)
+			continue
+		case status := <-e.haManager.statusChan:
+			log.V(1).Infof("Received HA status notification (%v)", status.State)
+			e.haManager.setStatus(status)
+			continue
+		default:
+		}
+		select {
+		case state := <-e.haManager.stateChan:
+			log.Infof("Received HA state notification %v", state)
+			e.haManager.setState(state)
+
+		case status := <-e.haManager.statusChan:
+			log.V(1).Infof("Received HA status notification (%v)", status.State)
+			e.haManager.setStatus(status)
+
 		case n := <-e.notifier.C:
 			log.Infof("Received cluster config notification; %v", &n)
+			e.syncServer.notify(&SyncNote{Type: SNTConfigUpdate, Time: time.Now()})
 
-			e.syncServer.notify(&SyncNote{Type: SNTConfigUpdate})
+			vua, err := newVserverUserAccess(n.Cluster)
+			if err != nil {
+				log.Errorf("Ignoring notification due to invalid vserver access configuration: %v", err)
+				return
+			}
 
 			e.clusterLock.Lock()
 			e.cluster = n.Cluster
 			e.clusterLock.Unlock()
+
+			e.vserverAccess.update(vua)
 
 			if n.MetadataOnly {
 				log.Infof("Only metadata changes found, processing complete.")
@@ -387,17 +432,11 @@ func (e *Engine) manager() {
 			// TODO(jsing): Ensure this does not block.
 			e.updateVservers()
 
-		case state := <-e.haManager.stateChan:
-			log.Infof("Received HA state notification %v", state)
-			e.haManager.setState(state)
-
-		case status := <-e.haManager.statusChan:
-			log.Infof("Received HA status notification (%v)", status.State)
-			e.haManager.setStatus(status)
+			e.updateARPMap()
 
 		case <-e.haManager.timer():
 			log.Infof("Timed out waiting for HAState")
-			e.haManager.setState(seesaw.HAUnknown)
+			e.haManager.setState(spb.HaState_UNKNOWN)
 
 		case svs := <-e.vserverChan:
 			if _, ok := e.vservers[svs.Name]; !ok {
@@ -410,7 +449,7 @@ func (e *Engine) manager() {
 			e.vserverLock.Unlock()
 
 		case override := <-e.overrideChan:
-			sn := &SyncNote{Type: SNTOverride}
+			sn := &SyncNote{Type: SNTOverride, Time: time.Now()}
 			switch o := override.(type) {
 			case *seesaw.BackendOverride:
 				sn.BackendOverride = o
@@ -436,6 +475,7 @@ func (e *Engine) manager() {
 			e.shutdownVservers()
 			e.hcManager.shutdown()
 			e.deleteVLANs()
+			e.ncc.Close()
 
 			log.Info("Shutdown complete")
 			return
@@ -476,6 +516,59 @@ func (e *Engine) updateVservers() {
 	}
 	for _, config := range cluster.Vservers {
 		e.vservers[config.Name].updateConfig(config)
+	}
+}
+
+// updateARPMap goes through the new config and updates the internal ARP map so that
+// the gratutious arp loop adopts to new changes.
+func (e *Engine) updateARPMap() {
+	arpMap := make(map[string][]net.IP)
+	defer func() {
+		e.arpLock.Lock()
+		defer e.arpLock.Unlock()
+		e.arpMap = arpMap
+	}()
+
+	arpMap[e.config.LBInterface] = []net.IP{e.config.ClusterVIP.IPv4Addr}
+	if e.config.UseVMAC {
+		// If using VMAC, only announce ClusterVIP is enough.
+		return
+	}
+
+	e.clusterLock.RLock()
+	cluster := e.cluster
+	e.clusterLock.RUnlock()
+
+	e.vlanLock.RLock()
+	defer e.vlanLock.RUnlock()
+	for _, vserver := range cluster.Vservers {
+		for _, vip := range vserver.VIPs {
+			if vip.Type == seesaw.AnycastVIP {
+				continue
+			}
+			ip := vip.IP.IP()
+			if ip.To4() == nil {
+				// IPv6 address is not yet supported.
+				continue
+			}
+			found := false
+			for _, vlan := range e.vlans {
+				ipNet := vlan.IPv4Net()
+				if ipNet == nil {
+					continue
+				}
+				if ipNet.Contains(ip) {
+					ifName := fmt.Sprintf("%s.%d", e.config.LBInterface, vlan.ID)
+					arpMap[ifName] = append(arpMap[ifName], ip)
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Use LB interface if no vlan matches
+				arpMap[e.config.LBInterface] = append(arpMap[e.config.LBInterface], ip)
+			}
+		}
 	}
 }
 
@@ -522,11 +615,6 @@ func (e *Engine) updateVLANs() {
 		}
 	}
 
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	for _, vlan := range remove {
 		log.Infof("Removing VLAN interface %v", vlan)
 		if err := e.lbInterface.DeleteVLAN(vlan); err != nil {
@@ -546,11 +634,6 @@ func (e *Engine) updateVLANs() {
 // deleteVLANs removes all the VLAN interfaces that have been created by this
 // engine.
 func (e *Engine) deleteVLANs() {
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	e.vlanLock.Lock()
 	defer e.vlanLock.Unlock()
 
@@ -594,13 +677,7 @@ func (e *Engine) distributeOverride(o seesaw.Override) {
 // becomeMaster performs the necessary actions for the Seesaw Engine to
 // become the master node.
 func (e *Engine) becomeMaster() {
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	e.syncClient.disable()
-	e.hcManager.enable()
 	e.notifier.SetSource(config.SourceServer)
 
 	if err := e.lbInterface.Up(); err != nil {
@@ -611,13 +688,7 @@ func (e *Engine) becomeMaster() {
 // becomeBackup performs the neccesary actions for the Seesaw Engine to
 // stop being the master node and become the backup node.
 func (e *Engine) becomeBackup() {
-	if err := e.ncc.Dial(); err != nil {
-		log.Fatalf("Failed to connect to NCC: %v", err)
-	}
-	defer e.ncc.Close()
-
 	e.syncClient.enable()
-	e.hcManager.disable()
 	e.notifier.SetSource(config.SourceServer)
 
 	if err := e.lbInterface.Down(); err != nil {

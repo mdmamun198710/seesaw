@@ -63,9 +63,10 @@ type Command struct {
 var commands = []Command{
 	{"config", &commandConfig, nil},
 	{"exit", nil, exit},
-	{"quit", nil, exit}, // An alias for exit, matches JunOS behavior.
 	{"failover", nil, failover},
+	{"help", nil, help},
 	{"override", &commandOverride, nil},
+	{"quit", nil, exit}, // An alias for exit, matches JunOS behavior.
 	{"show", &commandShow, nil},
 }
 

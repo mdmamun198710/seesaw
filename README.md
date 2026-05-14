@@ -33,8 +33,7 @@ Seesaw v2 is developed in Go and depends on several Go packages:
 - [github.com/miekg/dns](http://godoc.org/github.com/miekg/dns)
 
 Additionally, there is a compile and runtime dependency on
-[libnl](https://www.infradead.org/~tgr/libnl/) and a compile time dependency on
-the Go protobuf compiler.
+[libnl](https://www.infradead.org/~tgr/libnl/)
 
 On a Debian/Ubuntu style system, you should be able to prepare for building
 by running:
@@ -42,15 +41,11 @@ by running:
     apt-get install golang
     apt-get install libnl-3-dev libnl-genl-3-dev
 
-If your distro has a go version before 1.5, you may need to fetch a newer
+If your distro has a go version before 1.18, you may need to fetch a newer
 release from https://golang.org/dl/.
 
-If you are running go version 1.11 and above, you can use go modules to avoid
-installing go packages manually. By go 1.12, `GO111MODULE` defaults to `auto`,
-so remember to enable go module by `export GO111MODULE=on`.
-
-If you are running before go version 1.11 or you don't want to enable
-GO111MODULE, after setting `GOPATH` to an appropriate location (for example `~/go`):
+If you are running before go version 1.11 or you want to set `GO111MODULE=off`,
+after setting `GOPATH` to an appropriate location (for example `~/go`):
 
     go get -u golang.org/x/crypto/ssh
     go get -u github.com/dlintw/goconf
@@ -64,11 +59,9 @@ Ensure that `${GOPATH}/bin` is in your `${PATH}` and in the seesaw directory:
     make test
     make install
 
-If you wish to regenerate the protobuf code, the protobuf compiler and Go
-protobuf compiler generator are also needed:
+If you wish to regenerate the protobuf code, the protobuf compiler is needed:
 
     apt-get install protobuf-compiler
-    go get -u github.com/golang/protobuf/{proto,protoc-gen-go}
 
 The protobuf code can then be regenerated with:
 

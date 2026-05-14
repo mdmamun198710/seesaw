@@ -30,6 +30,7 @@ import (
 
 	"github.com/google/seesaw/common/seesaw"
 	pb "github.com/google/seesaw/pb/config"
+	spb "github.com/google/seesaw/pb/seesaw"
 
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -44,6 +45,7 @@ var defaultArchiveConfig = archiveConfig{
 // Source specifies a source of configuration information.
 type Source int
 
+// Values for Source.
 const (
 	SourceNone Source = iota
 	SourceDisk
@@ -177,12 +179,25 @@ func protoToCluster(p *pb.Cluster, clusterName string) (*Cluster, error) {
 	c.BGPLocalASN = uint32(p.GetBgpLocalAsn())
 	c.BGPRemoteASN = uint32(p.GetBgpRemoteAsn())
 
-	addBGPPeers(c, p)
+	if err := addAccessGroups(c, p); err != nil {
+		return nil, err
+	}
+	if err := addBGPPeers(c, p); err != nil {
+		return nil, err
+	}
 	addMetadata(c, p)
-	addNodes(c, p)
-	addVIPSubnets(c, p)
-	addVLANs(c, p)
-	addVservers(c, p)
+	if err := addNodes(c, p); err != nil {
+		return nil, err
+	}
+	if err := addVIPSubnets(c, p); err != nil {
+		return nil, err
+	}
+	if err := addVLANs(c, p); err != nil {
+		return nil, err
+	}
+	if err := addVservers(c, p); err != nil {
+		return nil, err
+	}
 	addWarnings(c, p)
 
 	return c, nil
@@ -224,6 +239,8 @@ func protoToHealthcheck(p *pb.Healthcheck, defaultPort uint16) *Healthcheck {
 		hcMode = seesaw.HCModePlain
 	case pb.Healthcheck_DSR:
 		hcMode = seesaw.HCModeDSR
+	case pb.Healthcheck_TUN:
+		hcMode = seesaw.HCModeTUN
 	}
 	var hcType seesaw.HealthcheckType
 	switch p.GetType() {
@@ -273,11 +290,28 @@ func protoToHost(p *pb.Host) seesaw.Host {
 	}
 }
 
-func addBGPPeers(c *Cluster, p *pb.Cluster) {
+func addAccessGroups(c *Cluster, p *pb.Cluster) error {
+	for _, p := range p.GetAccessGroups() {
+		group := &AccessGroup{
+			Name:    p.GetName(),
+			Members: p.GetMember(),
+		}
+		sort.Strings(group.Members)
+		if err := c.AddAccessGroup(group); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addBGPPeers(c *Cluster, p *pb.Cluster) error {
 	for _, p := range p.BgpPeer {
 		peer := protoToHost(p)
-		c.AddBGPPeer(&peer)
+		if err := c.AddBGPPeer(&peer); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func addMetadata(c *Cluster, p *pb.Cluster) {
@@ -292,7 +326,7 @@ func addMetadata(c *Cluster, p *pb.Cluster) {
 	}
 }
 
-func addNodes(c *Cluster, p *pb.Cluster) {
+func addNodes(c *Cluster, p *pb.Cluster) error {
 	var haEnabled bool
 	switch *p.SeesawVip.Status {
 	case pb.Host_PRODUCTION, pb.Host_TESTING, pb.Host_BUILDING:
@@ -300,9 +334,9 @@ func addNodes(c *Cluster, p *pb.Cluster) {
 	}
 
 	for _, n := range p.Node {
-		haState := seesaw.HAUnknown
+		haState := spb.HaState_UNKNOWN
 		if !haEnabled || p.SeesawVip.GetStatus() != n.GetStatus() {
-			haState = seesaw.HADisabled
+			haState = spb.HaState_DISABLED
 		}
 
 		h := protoToHost(n)
@@ -315,7 +349,9 @@ func addNodes(c *Cluster, p *pb.Cluster) {
 			node.BGPEnabled = true
 			node.VserversEnabled = true
 		}
-		c.AddNode(node)
+		if err := c.AddNode(node); err != nil {
+			return err
+		}
 	}
 
 	// Prioritise nodes by their IPv4 addresses.
@@ -323,28 +359,29 @@ func addNodes(c *Cluster, p *pb.Cluster) {
 	for _, n := range c.Nodes {
 		nodes = append(nodes, n)
 	}
-	sort.Sort(seesaw.NodesByIPv4{nodes})
+	sort.Sort(seesaw.NodesByIPv4{Nodes: nodes})
 	for i, n := range nodes {
-		switch i {
-		case 0:
+		if i == 0 {
 			n.Priority = 255
-		case 1:
-			n.Priority = 1
-		default:
-			break
+			continue
 		}
+		n.Priority = uint8(len(nodes) - i)
 	}
+	return nil
 }
 
-func addVLANs(c *Cluster, p *pb.Cluster) {
+func addVLANs(c *Cluster, p *pb.Cluster) error {
 	for _, v := range p.Vlan {
 		h := protoToHost(v.Host)
-		c.AddVLAN(&seesaw.VLAN{
+		vlan := &seesaw.VLAN{
 			ID:           uint16(*v.VlanId),
 			Host:         h,
 			BackendCount: make(map[seesaw.AF]uint),
 			VIPCount:     make(map[seesaw.AF]uint),
-		})
+		}
+		if err := c.AddVLAN(vlan); err != nil {
+			return err
+		}
 	}
 
 	// Determine number of backend and VIP addresses in each VLAN.
@@ -386,22 +423,25 @@ func addVLANs(c *Cluster, p *pb.Cluster) {
 			}
 		}
 	}
+	return nil
 }
 
-func addVIPSubnets(c *Cluster, p *pb.Cluster) {
+func addVIPSubnets(c *Cluster, p *pb.Cluster) error {
 	for _, cidr := range p.DedicatedVipSubnet {
 		_, vipSubnet, err := net.ParseCIDR(cidr)
 		if err != nil {
-			log.Errorf("%v: Unable to parse VIP subnet %v: %v", c.Site, cidr, err)
-			continue
+			return fmt.Errorf("%v: unable to parse VIP subnet %v: %v", c.Site, cidr, err)
 		}
 		if err := c.AddVIPSubnet(vipSubnet); err != nil {
-			log.Errorf("%v: Unable to add VIP subnet %v: %v", c.Site, cidr, err)
+			return err
 		}
 	}
+	return nil
 }
 
-func addVservers(c *Cluster, p *pb.Cluster) {
+func addVservers(c *Cluster, p *pb.Cluster) error {
+	// TODO: Decide whether to mark VServers with invalid config as broken in
+	// some way, or to propagate the error.
 	for _, vs := range p.Vserver {
 		host := vs.GetEntryAddress()
 		v := NewVserver(vs.GetName(), protoToHost(host))
@@ -411,8 +451,11 @@ func addVservers(c *Cluster, p *pb.Cluster) {
 		sort.Strings(v.Warnings)
 
 		for _, ip := range []net.IP{v.Host.IPv4Addr, v.Host.IPv6Addr} {
-			if ip != nil {
-				v.AddVIP(seesaw.NewVIP(ip, c.VIPSubnets))
+			if ip == nil {
+				continue
+			}
+			if err := v.AddVIP(seesaw.NewVIP(ip, c.VIPSubnets)); err != nil {
+				log.Warningf("Adding VIP: %v", err)
 			}
 		}
 
@@ -442,6 +485,8 @@ func addVservers(c *Cluster, p *pb.Cluster) {
 				scheduler = seesaw.LBSchedulerWLC
 			case pb.VserverEntry_SH:
 				scheduler = seesaw.LBSchedulerSH
+			case pb.VserverEntry_MH:
+				scheduler = seesaw.LBSchedulerMH
 			default:
 				// TODO(angusc): Consider this VServer broken.
 				log.Errorf("%v: Unsupported scheduler %v", vs.GetName(), ve.GetScheduler())
@@ -455,6 +500,8 @@ func addVservers(c *Cluster, p *pb.Cluster) {
 				mode = seesaw.LBModeDSR
 			case pb.VserverEntry_NAT:
 				mode = seesaw.LBModeNAT
+			case pb.VserverEntry_TUN:
+				mode = seesaw.LBModeTUN
 			default:
 				// TODO(angusc): Consider this VServer broken.
 				log.Errorf("%v: Unsupported mode %v", vs.GetName(), ve.GetMode())
@@ -497,10 +544,20 @@ func addVservers(c *Cluster, p *pb.Cluster) {
 				log.Warning(err)
 			}
 		}
+		for _, grant := range vs.AccessGrant {
+			g := &AccessGrant{
+				Grantee: grant.GetGrantee(),
+				IsGroup: grant.GetType() == pb.AccessGrant_GROUP,
+			}
+			if err := v.AddAccessGrant(g); err != nil {
+				log.Warning(err)
+			}
+		}
 		if err := c.AddVserver(v); err != nil {
 			log.Warning(err)
 		}
 	}
+	return nil
 }
 
 func addWarnings(c *Cluster, p *pb.Cluster) {

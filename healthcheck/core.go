@@ -90,7 +90,7 @@ type Target struct {
 // String returns the string representation of a healthcheck target.
 func (t Target) String() string {
 	var via string
-	if t.Mode == seesaw.HCModeDSR {
+	if t.Mode != seesaw.HCModePlain {
 		via = fmt.Sprintf(" (via %s mark %d)", t.Host, t.Mark)
 	}
 	return fmt.Sprintf("%s %s%s", t.addr(), t.Mode, via)
@@ -209,6 +209,7 @@ type Check struct {
 
 	lock      sync.RWMutex
 	blocking  bool
+	dryrun    bool
 	start     time.Time
 	failed    uint64
 	failures  uint64
@@ -303,7 +304,13 @@ func (hc *Check) healthcheck() {
 		return
 	}
 	start := time.Now()
-	result := hc.execute()
+
+	var result *Result
+	if hc.dryrun {
+		result = complete(start, "dryrun mode; always succeed", true, nil)
+	} else {
+		result = hc.execute()
+	}
 
 	status := "SUCCESS"
 	if !result.Success {
@@ -353,16 +360,17 @@ func (hc *Check) Notify() {
 func (hc *Check) execute() *Result {
 	ch := make(chan *Result, 1)
 	checker := hc.Checker
+	timeout := hc.Timeout
 	go func() {
 		// TODO(jsing): Determine a way to ensure that this go routine
 		// does not linger.
-		ch <- checker.Check(hc.Timeout)
+		ch <- checker.Check(timeout)
 	}()
 	select {
 	case result := <-ch:
 		return result
-	case <-time.After(hc.Timeout):
-		return &Result{"Timed out", false, hc.Timeout, nil}
+	case <-time.After(timeout):
+		return &Result{"Timed out", false, timeout, nil}
 	}
 }
 
@@ -382,6 +390,11 @@ func (hc *Check) Blocking(block bool) {
 	}
 	hc.blocking = block
 	hc.update = make(chan Config, len)
+}
+
+// Dryrun enables or disables dryrun mode for a healthcheck.
+func (hc *Check) Dryrun(dryrun bool) {
+	hc.dryrun = dryrun
 }
 
 // Update queues a healthcheck configuration update for processing.
@@ -405,7 +418,9 @@ type ServerConfig struct {
 	EngineSocket   string
 	MaxFailures    int
 	NotifyInterval time.Duration
+	FetchInterval  time.Duration
 	RetryDelay     time.Duration
+	DryRun         bool
 }
 
 var defaultServerConfig = ServerConfig{
@@ -415,6 +430,7 @@ var defaultServerConfig = ServerConfig{
 	EngineSocket:   seesaw.EngineSocket,
 	MaxFailures:    10,
 	NotifyInterval: 15 * time.Second,
+	FetchInterval:  15 * time.Second,
 	RetryDelay:     2 * time.Second,
 }
 
@@ -503,7 +519,7 @@ func (s *Server) updater() {
 		} else {
 			log.Infof("Engine returned %d healthchecks", len(checks.Configs))
 			s.configs <- checks.Configs
-			time.Sleep(15 * time.Second)
+			time.Sleep(s.config.FetchInterval)
 		}
 	}
 }
@@ -531,6 +547,7 @@ func (s *Server) manager() {
 			for id := range configs {
 				if s.healthchecks[id] == nil {
 					hc := NewCheck(s.notify)
+					hc.Dryrun(s.config.DryRun)
 					s.healthchecks[id] = hc
 					go hc.Run(checkTicker.C)
 				}

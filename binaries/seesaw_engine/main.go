@@ -23,11 +23,12 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/google/seesaw/common/seesaw"
 	"github.com/google/seesaw/common/server"
-	"github.com/google/seesaw/engine/config"
 	"github.com/google/seesaw/engine"
+	"github.com/google/seesaw/engine/config"
 
 	conf "github.com/dlintw/goconf"
 	log "github.com/golang/glog"
@@ -114,6 +115,23 @@ func main() {
 		log.Exitf("Unable to get cluster peer_ipv6: %v", err)
 	}
 
+	useVMAC := config.DefaultEngineConfig().UseVMAC
+	if cfg.HasOption("cluster", "use_vmac") {
+		uv, err := cfg.GetBool("cluster", "use_vmac")
+		if err != nil {
+			log.Exitf("Unable to get use_vmac: %v", err)
+		}
+		useVMAC = uv
+	}
+	garpInterval := config.DefaultEngineConfig().GratuitousARPInterval
+	if cfg.HasOption("cluster", "garp_interval_sec") {
+		it, err := cfg.GetInt("cluster", "garp_interval_sec")
+		if err != nil {
+			log.Exitf("Unable to get garp_interval_sec: %v", err)
+		}
+		garpInterval = time.Duration(it) * time.Second
+	}
+
 	// The default VRID may be overridden via the config file.
 	vrid := config.DefaultEngineConfig().VRID
 	if cfg.HasOption("cluster", "vrid") {
@@ -191,6 +209,13 @@ func main() {
 	engineCfg.ServiceAnycastIPv6 = serviceAnycastIPv6
 	engineCfg.SocketPath = *socketPath
 	engineCfg.VRID = vrid
+	engineCfg.UseVMAC = useVMAC
+	engineCfg.GratuitousARPInterval = garpInterval
+
+	// removes previous leftover socket.
+	if err := server.RemoveUnixSocket(engineCfg.SocketPath); err != nil {
+		log.Exitf("Failed to remove socket: %v", err)
+	}
 
 	// Gentlemen, start your engines...
 	engine := engine.NewEngine(&engineCfg)
